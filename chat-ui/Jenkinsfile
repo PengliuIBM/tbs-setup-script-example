@@ -1,0 +1,83 @@
+pipeline {
+  agent {
+    kubernetes {
+      label 'jnlp'
+    }
+  }
+
+  environment {
+    APP_NAME="chatui"
+    REG_URL="harbor.haas-495.pez.vmware.com/cicd"
+    SCM_URL="git@gitlab.haas-495.pez.vmware.com:jeffrey"
+    TBS_SCM_URL="git@gitlab.haas-495.pez.vmware.com:22/jeffrey"
+  }
+
+  stages {
+
+    stage('Fetch from GitHub') {
+        steps {
+            dir("app"){
+                git(
+                    poll: true,
+                    changelog: true,
+                    branch: "master",
+                    credentialsId: "218fd592-da99-40e4-9a72-04415b80203d",
+                    url: "${SCM_URL}/${APP_NAME}.git"
+                )
+                sh 'git rev-parse HEAD > git-commit.txt'
+            }
+             dir("gitops"){
+                git(
+                    poll: false,
+                    changelog: false,
+                    branch: "master",
+                    credentialsId: "218fd592-da99-40e4-9a72-04415b80203d",
+                    url: "${SCM_URL}/${APP_NAME}-gitops.git"
+                )
+            }
+        }
+    }
+
+    stage('build tbs') {
+      steps {
+        echo "Start building image"
+        sh '''#!/bin/sh -e
+           export GIT_COMMIT=$(cat app/git-commit.txt)
+           echo $GIT_COMMIT
+           kp image save ${APP_NAME} \
+           --tag ${REG_URL}/${APP_NAME} \
+           --git ${TBS_SCM_URL}/${APP_NAME} \
+           --git-revision ${GIT_COMMIT} \
+           --wait
+           '''
+      }
+    }
+
+    stage('update image') {
+      steps {
+        echo "Start updating image"
+        sshagent(['218fd592-da99-40e4-9a72-04415b80203d']) {
+            sh '''#!/bin/sh -e
+            kubectl get image ${APP_NAME} -n default -o json | jq -r .status.latestImage >> containerversion.txt
+            export APP_IMAGE="$(cat containerversion.txt | cut -d ':' -f 1)"
+            export APP_TAG="$(cat containerversion.txt | cut -d ':' -f 2)"
+            #######
+            ##export CONTAINER_VERSION="$(cat containerversion.txt)"
+            cd gitops
+            yq e '.image.repository = env(APP_IMAGE)' -i values.yaml
+            yq e '.image.tag = env(APP_TAG)' -i values.yaml
+            git config --global user.name "jeffrey wang"
+            git config --global user.email "jefwang@haas-495.pez.vmware.com"
+            git add .
+            git diff-index --quiet HEAD || git commit -m "update by ci"
+            mkdir -p ~/.ssh
+            #cat /tmp/sshkey/ssh-privatekey >> ~/.ssh/id_rsa
+            #chmod 600 ~/.ssh/id_rsa
+            ssh-keyscan -t rsa gitlab.haas-495.pez.vmware.com >> ~/.ssh/known_hosts
+            git push --set-upstream origin master
+            '''
+        }
+      }
+    }
+  }
+}
